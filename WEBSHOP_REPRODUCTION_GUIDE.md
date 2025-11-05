@@ -1,0 +1,395 @@
+# RAGEN WebShop Reproduction Guide
+
+## Overview
+
+This guide provides complete instructions for reproducing the RAGEN experiments on the WebShop environment. WebShop is an interactive e-commerce environment where the agent must search for products, navigate through search results, select appropriate attributes (size, color), and purchase products that match given descriptions.
+
+## What is RAGEN on WebShop?
+
+RAGEN (Reasoning AGENT) uses reinforcement learning to train LLMs to act as shopping agents. The agent learns to:
+- Parse natural language shopping instructions
+- Search for products using keywords
+- Navigate through product listings
+- Select appropriate product attributes (size, color)
+- Make purchase decisions within action limits
+
+The training uses the StarPO (State-Thinking-Action-Reward Policy Optimization) algorithm to optimize the agent's behavior through multi-turn interactions.
+
+## Prerequisites
+
+- Conda package manager
+- CUDA-enabled GPU (recommended: A100 80GB, minimum: RTX 4090 with adjusted parameters)
+- Python 3.12
+- Java Development Kit (for WebShop backend)
+
+## Setup Instructions
+
+### Step 1: Set Up Base RAGEN Environment
+
+First, set up the base RAGEN environment:
+
+```bash
+# Clone the repository (if not already done)
+git clone https://github.com/RAGEN-AI/RAGEN.git
+cd RAGEN
+
+# Run the base setup script
+bash scripts/setup_ragen.sh
+```
+
+If the automatic setup fails, follow the manual instructions in `scripts/setup_ragen.md`.
+
+### Step 2: Set Up WebShop Environment
+
+After the base environment is ready, install WebShop-specific dependencies:
+
+```bash
+# Activate the conda environment
+conda activate ragen
+
+# Run the WebShop setup script
+bash scripts/setup_webshop.sh
+```
+
+This script will:
+1. Install Java Development Kit (OpenJDK 21)
+2. Install faiss-cpu for search functionality
+3. Install the webshop-minimal package
+4. Download spaCy language models (en_core_web_sm and en_core_web_lg)
+5. Download WebShop datasets (both small and full versions)
+
+### Step 3: Verify Installation
+
+Check that the environment is correctly set up:
+
+```bash
+# Verify webshop-minimal is installed
+python -c "from webshop_minimal import WebAgentTextEnv; print('WebShop installed successfully')"
+
+# Check data directory
+ls -la external/webshop-minimal/webshop_minimal/data/
+```
+
+You should see:
+- `small/` directory with smaller dataset
+- `full/` directory with complete dataset (items_shuffle.json, items_ins_v2.json)
+
+## Training Configuration
+
+### Configuration Files
+
+The WebShop configuration is located at `config/_6_webshop.yaml`. Key parameters:
+
+```yaml
+# Model and batch size
+model_path: Qwen/Qwen2.5-3B-Instruct
+micro_batch_size_per_gpu: 1
+ppo_mini_batch_size: 32
+
+# Agent behavior
+agent_proxy:
+  max_turn: 9  # Maximum 9 actions per episode
+  max_actions_per_turn: 1  # One action per turn
+
+# Rollout settings
+actor_rollout_ref:
+  rollout:
+    max_model_len: 15000  # Maximum context length
+    max_num_batched_tokens: 15000
+
+# Environment configuration
+es_manager:
+  train:
+    env_configs:
+      tags: ["WebShop"]
+  val:
+    env_configs:
+      tags: ["WebShop"]
+```
+
+### Environment Details (from `config/envs.yaml`)
+
+The WebShop environment is configured with:
+- **max_actions_per_traj**: 9 (agent has 9 actions to complete a purchase)
+- **dataset**: small or full (configurable)
+- **env_instruction**: Instructions on how to interact with the WebShop
+
+Action types:
+- `search[<keywords>]` - Search for products
+- `click[<item_id>]` - Click on a product
+- `click[next >]` - Navigate to next page
+- `click[< prev]` - Navigate to previous page
+- `click[<color>]` - Select a color option
+- `click[<size>]` - Select a size option
+- `click[buy now]` - Purchase the product
+- `click[back to search]` - Return to search
+
+## Training the Model
+
+### Basic Training Command
+
+To start training RAGEN on WebShop:
+
+```bash
+# Make sure you're in the RAGEN directory
+cd RAGEN
+
+# Activate environment
+conda activate ragen
+
+# Start training
+python train.py --config-name _6_webshop
+```
+
+### Training with Custom Parameters
+
+For machines with limited memory (e.g., RTX 4090):
+
+```bash
+python train.py --config-name _6_webshop \
+  micro_batch_size_per_gpu=1 \
+  ppo_mini_batch_size=8 \
+  actor_rollout_ref.rollout.max_model_len=2048 \
+  actor_rollout_ref.rollout.response_length=128
+```
+
+### Training with LoRA (Parameter Efficient)
+
+For more efficient training with LoRA:
+
+```bash
+python train.py --config-name base-lora \
+  es_manager.train.env_configs.tags=[WebShop] \
+  es_manager.val.env_configs.tags=[WebShop] \
+  agent_proxy.max_turn=9 \
+  actor_rollout_ref.rollout.max_model_len=15000
+```
+
+Default LoRA settings:
+- LoRA rank: 64
+- LoRA alpha: 64
+- Actor learning rate: 1e-5
+- Critic learning rate: 1e-4
+
+### Monitoring Training
+
+Training progress is logged to Weights & Biases (wandb). Key metrics to monitor:
+
+1. **Reward metrics**: Average rewards per episode
+2. **Success rate**: Percentage of successful purchases
+3. **val/generations**: Actual trajectories generated by the model (visible in wandb)
+
+To view trajectories during training, check the `val/generations` metric in your wandb dashboard.
+
+## Evaluation
+
+### Running Evaluation
+
+To evaluate a trained model:
+
+```bash
+python -m ragen.llm_agent.agent_proxy --config-name _6_webshop
+```
+
+### Evaluation Configuration
+
+Create an evaluation config (e.g., `config/eval_webshop.yaml`):
+
+```yaml
+defaults:
+  - _6_webshop
+
+# Override for evaluation
+trainer:
+  experiment_name: webshop_eval
+
+# Limit context window for evaluation
+agent_proxy:
+  max_context_window: 5  # Limit to last 5 turns
+
+# Model checkpoint path
+model_path: /path/to/your/trained/model
+```
+
+Then run:
+
+```bash
+python -m ragen.llm_agent.agent_proxy --config-name eval_webshop
+```
+
+## Understanding the WebShop Environment
+
+### Environment Flow
+
+1. **Initial State**: Agent receives a shopping instruction
+   ```
+   Instruction: Find me machine wash men's t-shirts with long sleeve
+   with color: black, and size: xx-large, and price lower than 50.00 dollars
+   ```
+
+2. **Search Phase**: Agent searches for products
+   ```
+   <think>Search for the main category without color/size/price</think>
+   <answer>search[machine wash men's t-shirts with long sleeve]</answer>
+   ```
+
+3. **Navigation Phase**: Agent navigates search results
+   ```
+   <think>Product b09klqllt2 looks promising at $19.99</think>
+   <answer>click[b09klqllt2]</answer>
+   ```
+
+4. **Selection Phase**: Agent selects attributes
+   ```
+   <think>Select the right color</think>
+   <answer>click[black | blue]</answer>
+
+   <think>Select the right size</think>
+   <answer>click[xx-large]</answer>
+   ```
+
+5. **Purchase Phase**: Agent completes the purchase
+   ```
+   <think>Color and size are selected, ready to buy</think>
+   <answer>click[buy now]</answer>
+   ```
+
+### Reward Structure
+
+The WebShop environment provides rewards based on:
+- **Match score**: How well the purchased product matches the instruction
+- **Attribute match**: Whether color, size, and other attributes match
+- **Price constraint**: Whether the price is within the specified range
+- **Completion**: Whether a purchase was made within the action limit
+
+### Key Implementation Files
+
+- **Environment**: `ragen/env/webshop/env.py`
+- **Configuration**: `ragen/env/webshop/config.py`
+- **Training script**: `train.py`
+- **WebShop backend**: `external/webshop-minimal/`
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Java not found**
+   ```bash
+   sudo apt update
+   sudo apt install default-jdk
+   ```
+
+2. **WebShop data not downloaded**
+   ```bash
+   python scripts/download_data.py
+   ```
+
+3. **Memory issues during training**
+   - Reduce `micro_batch_size_per_gpu`
+   - Reduce `ppo_mini_batch_size`
+   - Reduce `max_model_len`
+   - Use LoRA for parameter-efficient training
+
+4. **CUDA out of memory**
+   ```bash
+   python train.py --config-name _6_webshop \
+     micro_batch_size_per_gpu=1 \
+     ppo_mini_batch_size=8 \
+     actor_rollout_ref.rollout.max_model_len=8000
+   ```
+
+### Debugging Tips
+
+1. **Check environment setup**:
+   ```python
+   from webshop_minimal import WebAgentTextEnv, init_basedir
+   init_basedir("small")
+   env = WebAgentTextEnv()
+   obs = env.reset(session=0)
+   print(obs)
+   ```
+
+2. **Inspect trajectories**: Monitor `val/generations` in wandb to see agent behavior
+
+3. **Check data loading**: Ensure `external/webshop-minimal/webshop_minimal/data/` contains the required files
+
+## Dataset Information
+
+### Small Dataset
+- Location: `external/webshop-minimal/webshop_minimal/data/small/`
+- Suitable for quick experiments and debugging
+- Faster training iteration
+
+### Full Dataset
+- Location: `external/webshop-minimal/webshop_minimal/data/full/`
+- Contains: `items_shuffle.json`, `items_ins_v2.json`
+- More comprehensive product catalog
+- Better for final model training
+
+To switch datasets, modify `config/_6_webshop.yaml`:
+```yaml
+es_manager:
+  train:
+    env_configs:
+      tags: ["WebShop"]
+      env_config:
+        dataset: full  # or small
+```
+
+## Expected Results
+
+With proper training:
+- Agent learns to search efficiently (avoids redundant searches)
+- Agent selects products matching the description
+- Agent correctly selects size and color attributes
+- Agent completes purchases within action limits
+- Success rate improves over training iterations
+
+## Advanced Configuration
+
+### Using Different Base Models
+
+```bash
+python train.py --config-name _6_webshop \
+  model_path=Qwen/Qwen2.5-7B-Instruct
+```
+
+### Adjusting Action Limits
+
+Modify in config file:
+```yaml
+agent_proxy:
+  max_turn: 15  # Allow more actions
+```
+
+### Custom Reward Functions
+
+Create a custom reward function in `ragen/env/webshop/env.py` to modify the reward signal based on your objectives.
+
+## References
+
+- [RAGEN Paper](https://arxiv.org/abs/2504.20073)
+- [RAGEN Documentation](https://ragen-doc.readthedocs.io/)
+- [WebShop Paper](https://arxiv.org/abs/2207.01206)
+- [WebShop Original Repository](https://github.com/princeton-nlp/WebShop)
+
+## Citation
+
+If you use RAGEN for WebShop experiments, please cite:
+
+```bibtex
+@misc{ragen,
+  title={RAGEN: Understanding Self-Evolution in LLM Agents via Multi-Turn Reinforcement Learning},
+  author={Zihan Wang and Kangrui Wang and Qineng Wang and Pingyue Zhang and others},
+  year={2025},
+  eprint={2504.20073},
+  archivePrefix={arXiv},
+}
+```
+
+## Support
+
+For issues or questions:
+- Create an issue on [GitHub](https://github.com/RAGEN-AI/RAGEN/issues)
+- Check the [documentation](https://ragen-doc.readthedocs.io/)
+- Review existing issues for similar problems
